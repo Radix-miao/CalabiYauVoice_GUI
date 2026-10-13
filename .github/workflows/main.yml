@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       build_type:
-        description: 'release = ProGuard 混淆（正式发布）；main = 不混淆，排查启动问题时用'
+        description: 'main = 不裁剪（当前可用）；release = ProGuard，2.1.20 上 CI 失败，等日志回捞修好再选'
         type: choice
         required: false
-        default: 'release'
+        default: 'main'
         options:
-          - release
           - main
+          - release
       portable_zip:
         description: '同时生成免安装 zip'
         type: boolean
@@ -63,7 +63,8 @@ jobs:
             exit 1
           fi
           build_type='${{ inputs.build_type }}'
-          [ -n "$build_type" ] || build_type=release
+          # tag 触发时 inputs 为空，跟手动默认保持一致
+          [ -n "$build_type" ] || build_type=main
           if [ "$build_type" = release ]; then
             echo 'task=:desktopApp:packageReleaseDistributionForCurrentOS' >> "$GITHUB_OUTPUT"
             echo 'binaries_dir=main-release' >> "$GITHUB_OUTPUT"
@@ -96,6 +97,31 @@ jobs:
           ./gradlew --stacktrace '${{ steps.meta.outputs.task }}' \
             -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
             -Dkotlin.daemon.jvmargs="-Xmx4g"
+
+      # Compose 的 ProGuard 任务把 JDK 子进程的 stdout/stderr 只写进
+      # build/compose/logs/proguardReleaseJars/*.txt，Gradle 那边只给一层
+      # "Exit code: 1" 堆栈。失败时把文件内容灌进构建日志，否则根本看不出原因。
+      - name: 失败时打印 ProGuard / jpackage 日志
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in desktopApp/build/compose/logs/*/*.txt; do
+            echo "===== $f ====="
+            cat "$f"
+            echo
+          done
+
+      - name: 失败时上传诊断日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ steps.meta.outputs.binaries_dir }}-${{ steps.meta.outputs.short_sha }}
+          path: |
+            desktopApp/build/compose/logs/
+            desktopApp/build/compose/tmp/proguardReleaseJars/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: 收集安装包
         shell: bash
