@@ -66,10 +66,10 @@ jobs:
           # tag 触发时 inputs 为空，跟手动默认保持一致
           [ -n "$build_type" ] || build_type=main
           if [ "$build_type" = release ]; then
-            echo 'task=:desktopApp:packageReleaseDistributionForCurrentOS' >> "$GITHUB_OUTPUT"
+            echo 'tasks=:desktopApp:packageReleaseDistributionForCurrentOS :desktopApp:createReleaseDistributable' >> "$GITHUB_OUTPUT"
             echo 'binaries_dir=main-release' >> "$GITHUB_OUTPUT"
           else
-            echo 'task=:desktopApp:packageDistributionForCurrentOS' >> "$GITHUB_OUTPUT"
+            echo 'tasks=:desktopApp:packageDistributionForCurrentOS :desktopApp:createDistributable' >> "$GITHUB_OUTPUT"
             echo 'binaries_dir=main' >> "$GITHUB_OUTPUT"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -94,9 +94,11 @@ jobs:
         run: |
           # 仓库 gradle.properties 的 -Xmx16g 是给本地大内存机器的，Runner 只有 16G，
           # Gradle + Kotlin daemon 叠起来会 OOM，这里压小。
-          ./gradlew --stacktrace '${{ steps.meta.outputs.task }}' \
+          ./gradlew --stacktrace $TASKS \
             -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
             -Dkotlin.daemon.jvmargs="-Xmx4g"
+        env:
+          TASKS: ${{ steps.meta.outputs.tasks }}
 
       # Compose 的 ProGuard 任务把 JDK 子进程的 stdout/stderr 只写进
       # build/compose/logs/proguardReleaseJars/*.txt，Gradle 那边只给一层
@@ -137,16 +139,25 @@ jobs:
             exit 1
           fi
 
+      # 免安装 zip 是加分项，不允许它把整个 run 拖失败；装完 MSI/EXE 就有得用。
       - name: 生成免安装 zip
         if: github.event_name != 'workflow_dispatch' || inputs.portable_zip
         shell: pwsh
         run: |
-          $app = Get-ChildItem 'desktopApp/build/compose/binaries/${{ steps.meta.outputs.binaries_dir }}/app' -Directory |
+          $base = 'desktopApp/build/compose/binaries'
+          # 不猜目录名：直接找应用镜像里的启动 exe（排除 exe/ msi/ 两个安装包目录）
+          $launcher = Get-ChildItem $base -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\(exe|msi)\\' } |
             Select-Object -First 1
-          if (-not $app) { throw '找不到 createReleaseDistributable 的 app 目录' }
-          # 连目录一起打包，解压后即 CalabiYauVoice_GUI-<版本>\，不会散在一堆文件里
-          Compress-Archive -Path $app.FullName `
-            -DestinationPath "dist/${{ steps.meta.outputs.version }}-windows-portable.zip" -Force
+          if ($launcher) {
+            $dst = "dist/${{ steps.meta.outputs.version }}-windows-portable.zip"
+            Compress-Archive -Path $launcher.Directory.FullName -DestinationPath $dst -Force
+            'zip 源目录: ' + $launcher.Directory.FullName | Add-Content $env:GITHUB_STEP_SUMMARY
+          } else {
+            "未找到应用镜像目录，跳过 zip。${base} 实际布局：" | Add-Content $env:GITHUB_STEP_SUMMARY
+            Get-ChildItem $base -Recurse -Depth 3 | ForEach-Object { $_.FullName.Replace("$PWD\", '') } |
+              Add-Content $env:GITHUB_STEP_SUMMARY
+          }
 
       - name: 上传 Artifacts
         uses: actions/upload-artifact@v4
