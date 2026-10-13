@@ -1,0 +1,152 @@
+name: Windows 桌面版打包
+
+# 在 GitHub 的 Windows Runner 上打出 Compose Desktop 的 Windows 安装包，
+# 本地不需要装 JDK / Android SDK / WiX。
+# 产物：MSI + EXE（release 走 ProGuard），可选免安装 zip。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'release = ProGuard 混淆（正式发布）；main = 不混淆，排查启动问题时用'
+        type: choice
+        required: false
+        default: 'release'
+        options:
+          - release
+          - main
+      portable_zip:
+        description: '同时生成免安装 zip'
+        type: boolean
+        required: false
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: Build Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # gradle/gradle-daemon-jvm.properties 已把构建 JVM 锁成 AMAZON/21，
+      # 用同厂商发行版可以避免 Gradle 再从 foojay 下一份 JDK。
+      # jpackage 生成的运行时也是这个 JDK，所以它就是安装包里的 runtime。
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 读取版本号
+        id: meta
+        shell: bash
+        run: |
+          version=$(sed -n 's/.*packageVersion = "\([^"]*\)".*/\1/p' desktopApp/build.gradle.kts | head -1)
+          if [ -z "$version" ]; then
+            echo 'desktopApp/build.gradle.kts 里找不到 packageVersion' >&2
+            exit 1
+          fi
+          build_type='${{ inputs.build_type }}'
+          [ -n "$build_type" ] || build_type=release
+          if [ "$build_type" = release ]; then
+            echo 'task=:desktopApp:packageReleaseDistributionForCurrentOS' >> "$GITHUB_OUTPUT"
+            echo 'binaries_dir=main-release' >> "$GITHUB_OUTPUT"
+          else
+            echo 'task=:desktopApp:packageDistributionForCurrentOS' >> "$GITHUB_OUTPUT"
+            echo 'binaries_dir=main' >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # jpackage 打 MSI/EXE 依赖 WiX Toolset；windows-latest 镜像自带，但只放在
+      # 固定安装目录，jpackage 需要 WIX 环境变量或 PATH 才找得到。
+      - name: 定位 Runner 自带的 WiX Toolset
+        shell: pwsh
+        run: |
+          $root = @('C:\Program Files (x86)', 'C:\Program Files') |
+            ForEach-Object { Get-ChildItem $_ -Directory -Filter 'WiX Toolset*' -ErrorAction SilentlyContinue } |
+            Sort-Object Name | Select-Object -Last 1
+          if (-not $root) { throw 'Runner 镜像里没找到 WiX Toolset，jpackage 无法生成 MSI/EXE' }
+          $bin = Join-Path $root.FullName 'bin'
+          "WIX=$bin" | Add-Content -Path $env:GITHUB_ENV
+          $bin | Add-Content -Path $env:GITHUB_PATH
+          "使用 WiX: $bin"
+
+      - name: 打包桌面版
+        shell: bash
+        run: |
+          # 仓库 gradle.properties 的 -Xmx16g 是给本地大内存机器的，Runner 只有 16G，
+          # Gradle + Kotlin daemon 叠起来会 OOM，这里压小。
+          ./gradlew --stacktrace '${{ steps.meta.outputs.task }}' \
+            -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            -Dkotlin.daemon.jvmargs="-Xmx4g"
+
+      - name: 收集安装包
+        shell: bash
+        env:
+          BINARIES: desktopApp/build/compose/binaries/${{ steps.meta.outputs.binaries_dir }}
+        run: |
+          shopt -s nullglob
+          mkdir -p dist
+          cp "$BINARIES"/exe/*.exe "$BINARIES"/msi/*.msi dist/ || true
+          if [ -z "$(ls -A dist)" ]; then
+            echo '未找到安装包，实际产物目录如下：' >&2
+            find desktopApp/build/compose/binaries -maxdepth 3 >&2
+            exit 1
+          fi
+
+      - name: 生成免安装 zip
+        if: github.event_name != 'workflow_dispatch' || inputs.portable_zip
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem 'desktopApp/build/compose/binaries/${{ steps.meta.outputs.binaries_dir }}/app' -Directory |
+            Select-Object -First 1
+          if (-not $app) { throw '找不到 createReleaseDistributable 的 app 目录' }
+          # 连目录一起打包，解压后即 CalabiYauVoice_GUI-<版本>\，不会散在一堆文件里
+          Compress-Archive -Path $app.FullName `
+            -DestinationPath "dist/${{ steps.meta.outputs.version }}-windows-portable.zip" -Force
+
+      - name: 上传 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CalabiYauVoice_GUI-${{ steps.meta.outputs.version }}-windows-${{ steps.meta.outputs.short_sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 写入任务摘要
+        shell: pwsh
+        run: |
+          '### Windows 桌面版 ${{ steps.meta.outputs.version }}' | Add-Content $env:GITHUB_STEP_SUMMARY
+          '' | Add-Content $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem dist | ForEach-Object {
+            '- `{0}` — {1:N1} MB' -f $_.Name, ($_.Length / 1MB)
+          } | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      # 只有打 tag（v2.1.20 这种）才发 GitHub Release；手动触发的只留 Artifacts。
+      - name: 发布 GitHub Release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # create 失败多半是 tag 上已经建过 Release（重跑本工作流时），此时改成覆盖上传资产
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "CalabiYauVoice_GUI ${{ steps.meta.outputs.version }} (Windows)" \
+            --notes "GitHub Actions 自动生成，commit ${{ steps.meta.outputs.short_sha }}。MSI/EXE 二选一，MSI 适合企业分发，EXE 双击即装。" \
+            || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
